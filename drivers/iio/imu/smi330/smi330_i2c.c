@@ -45,7 +45,9 @@
  **/
 #include <linux/i2c.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/regmap.h>
+#include <linux/version.h>
 
 #include "smi330.h"
 
@@ -57,7 +59,7 @@
 
 struct smi330_i2c_priv {
 	struct i2c_client *i2c;
-	u8 rx_buffer[SMI330_I2C_MAX_RX_BUFFER_SIZE] __aligned(IIO_DMA_MINALIGN);
+	u8 rx_buffer[SMI330_I2C_MAX_RX_BUFFER_SIZE] __aligned(ARCH_DMA_MINALIGN);
 };
 
 static int smi330_regmap_i2c_read(void *context, const void *reg_buf,
@@ -137,8 +139,12 @@ static const struct regmap_config smi330_regmap_config = {
 	.val_format_endian = REGMAP_ENDIAN_LITTLE,
 };
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 3, 0)
 static int smi330_i2c_probe(struct i2c_client *i2c,
 			    const struct i2c_device_id *id)
+#else
+static int smi330_i2c_probe(struct i2c_client *i2c)
+#endif
 {
 	struct device *dev = &i2c->dev;
 	struct smi330_i2c_priv *priv;
@@ -151,28 +157,39 @@ static int smi330_i2c_probe(struct i2c_client *i2c,
 	priv->i2c = i2c;
 	regmap = devm_regmap_init(dev, &smi330_regmap_bus, priv,
 				  &smi330_regmap_config);
-	if (IS_ERR(regmap))
-		return dev_err_probe(dev, PTR_ERR(regmap),
-				     "Failed to initialize I2C Regmap\n");
+	if (IS_ERR(regmap)) {
+		dev_err(dev, "Failed to initialize I2C Regmap\n");
+		return -1;
+	}
 
 	return smi330_core_probe(dev, regmap);
 }
 
-static const struct i2c_device_id smi330_i2c_id[] = { { "smi330", 0 }, {} };
-MODULE_DEVICE_TABLE(i2c, smi330_i2c_id);
+static const struct i2c_device_id smi330_i2c_device_id[] = {
+	{ .name = "smi330" },
+	{ }
+};
+MODULE_DEVICE_TABLE(i2c, smi330_i2c_device_id);
 
 static const struct of_device_id smi330_of_match[] = {
 	{ .compatible = "bosch,smi330" },
-	{},
+	{ }
 };
 MODULE_DEVICE_TABLE(of, smi330_of_match);
 
 static struct i2c_driver smi330_i2c_driver = {
 	.probe = smi330_i2c_probe,
-	.id_table = smi330_i2c_id,
+	.id_table = smi330_i2c_device_id,
 	.driver = {
 		.of_match_table = smi330_of_match,
 		.name = "smi330_i2c",
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 17, 0)
+#if IS_ENABLED(CONFIG_PM_SLEEP)
+		.pm = &smi330_pm_ops,
+#endif
+#else
+	    .pm = pm_sleep_ptr(&smi330_pm_ops),
+#endif
 	},
 };
 module_i2c_driver(smi330_i2c_driver);

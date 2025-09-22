@@ -47,6 +47,7 @@
 #include <linux/of.h>
 #include <linux/regmap.h>
 #include <linux/spi/spi.h>
+#include <linux/version.h>
 
 #include "smi330.h"
 
@@ -88,28 +89,38 @@ static int smi330_spi_probe(struct spi_device *spi)
 
 	regmap = devm_regmap_init(&spi->dev, &smi330_regmap_bus, &spi->dev,
 				  &smi330_regmap_config);
-	if (IS_ERR(regmap))
-		return dev_err_probe(&spi->dev, PTR_ERR(regmap),
-				     "Failed to initialize SPI Regmap\n");
+	if (IS_ERR(regmap)) {
+		dev_err(&spi->dev, "Failed to initialize SPI Regmap\n");
+		return -1;
+	}
 
 	return smi330_core_probe(&spi->dev, regmap);
 }
 
-static const struct spi_device_id smi330_spi_id[] = { { "smi330", 0 }, {} };
-MODULE_DEVICE_TABLE(spi, smi330_spi_id);
+static const struct spi_device_id smi330_spi_device_id[] = {
+	{ .name = "smi330" },
+	{ }
+};
+MODULE_DEVICE_TABLE(spi, smi330_spi_device_id);
 
 static const struct of_device_id smi330_of_match[] = {
 	{ .compatible = "bosch,smi330" },
-	{},
+	{ }
 };
 MODULE_DEVICE_TABLE(of, smi330_of_match);
 
 static struct spi_driver smi330_spi_driver = {
 	.probe = smi330_spi_probe,
-	.id_table = smi330_spi_id,
-	.driver = {
-		.of_match_table = smi330_of_match,
-		.name = "smi330_spi",
+	.id_table = smi330_spi_device_id,
+	.driver = { .of_match_table = smi330_of_match,
+		    .name = "smi330_spi",
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 17, 0)
+#if IS_ENABLED(CONFIG_PM_SLEEP)
+		.pm = &smi330_pm_ops,
+#endif
+#else
+		.pm = pm_sleep_ptr(&smi330_pm_ops),
+#endif
 	},
 };
 module_spi_driver(smi330_spi_driver);
