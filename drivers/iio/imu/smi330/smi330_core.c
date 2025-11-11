@@ -2576,6 +2576,7 @@ static int smi330_read_event_value(struct iio_dev *indio_dev,
 				*val = data->cfg.tilt_cfg.tilt_2.fields
 					       .beta_acc_mean;
 		}
+		break;
 	default:
 		break;
 	}
