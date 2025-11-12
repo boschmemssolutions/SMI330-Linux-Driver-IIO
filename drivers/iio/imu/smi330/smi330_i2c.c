@@ -46,6 +46,7 @@
 #include <linux/i2c.h>
 #include <linux/module.h>
 #include <linux/regmap.h>
+#include <linux/version.h>
 
 #include "smi330.h"
 
@@ -137,8 +138,12 @@ static const struct regmap_config smi330_regmap_config = {
 	.val_format_endian = REGMAP_ENDIAN_LITTLE,
 };
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 10, 0)
 static int smi330_i2c_probe(struct i2c_client *i2c,
 			    const struct i2c_device_id *id)
+#else
+static int smi330_i2c_probe(struct i2c_client *i2c)
+#endif
 {
 	struct device *dev = &i2c->dev;
 	struct smi330_i2c_priv *priv;
