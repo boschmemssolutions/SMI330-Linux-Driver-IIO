@@ -4,14 +4,14 @@
  * redistributing this file, you may do so under either license.
  *
  * GPL LICENSE
- * Copyright (c) 2023 Robert Bosch GmbH. All rights reserved.
+ * Copyright (c) 2024 Robert Bosch GmbH. All rights reserved.
  *
  * This file is free software licensed under the terms of version 2
  * of the GNU General Public License, available from the file LICENSE-GPL
  * in the main directory of this source tree.
  *
  * BSD LICENSE
- * Copyright (c) 2023 Robert Bosch GmbH. All rights reserved.
+ * Copyright (c) 2024 Robert Bosch GmbH. All rights reserved.
  *
  * BSD-3-Clause
  *
@@ -44,20 +44,24 @@
  *
  **/
 #include <linux/i2c.h>
+#include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/regmap.h>
+#include <linux/version.h>
 
 #include "smi330.h"
 
-#define I2C_XFER_MAX_RETRY 10
-#define I2C_WRITE_DELAY_TIME 10
+#define SMI330_NUM_DUMMY_BYTES 2
+#define SMI330_I2C_MAX_RX_BUFFER_SIZE \
+	(SMI330_NUM_DUMMY_BYTES + SMI330_FIFO_SIZE)
 
-#define NUM_DUMMY_BYTES 2
-#define SMI330_I2C_MAX_RX_BUFFER_SIZE (NUM_DUMMY_BYTES + SMI330_FIFO_SIZE)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 17, 0)
+#define pm_sleep_ptr(_ptr) PTR_IF(IS_ENABLED(CONFIG_PM_SLEEP), (_ptr))
+#endif
 
 struct smi330_i2c_priv {
 	struct i2c_client *i2c;
-	u8 rx_buffer[SMI330_I2C_MAX_RX_BUFFER_SIZE] __aligned(IIO_DMA_MINALIGN);
+	u8 rx_buffer[SMI330_I2C_MAX_RX_BUFFER_SIZE];
 };
 
 static int smi330_regmap_i2c_read(void *context, const void *reg_buf,
@@ -65,7 +69,7 @@ static int smi330_regmap_i2c_read(void *context, const void *reg_buf,
 				  size_t val_size)
 {
 	struct smi330_i2c_priv *priv = context;
-	int ret, retry;
+	int ret;
 
 	/*
 	 * SMI330 I2C read frame:
@@ -84,26 +88,19 @@ static int smi330_regmap_i2c_read(void *context, const void *reg_buf,
 		{
 			.addr = priv->i2c->addr,
 			.flags = priv->i2c->flags | I2C_M_RD,
-			.len = NUM_DUMMY_BYTES + val_size,
+			.len = SMI330_NUM_DUMMY_BYTES + val_size,
 			.buf = priv->rx_buffer,
 		},
 	};
 
-	for (retry = 0; retry < I2C_XFER_MAX_RETRY; retry++) {
-		ret = i2c_transfer(priv->i2c->adapter, msgs, ARRAY_SIZE(msgs));
-		if (ret > 0)
-			break;
+	if (SMI330_NUM_DUMMY_BYTES + val_size > SMI330_I2C_MAX_RX_BUFFER_SIZE)
+		return -EINVAL;
 
-		usleep_range(I2C_WRITE_DELAY_TIME * 1000,
-			     I2C_WRITE_DELAY_TIME * 1000);
-	}
+	ret = i2c_transfer(priv->i2c->adapter, msgs, ARRAY_SIZE(msgs));
+	if (ret < 0)
+		return ret;
 
-	if (retry >= I2C_XFER_MAX_RETRY) {
-		dev_err(&priv->i2c->adapter->dev, "Xfer error");
-		return -EIO;
-	}
-
-	memcpy(val_buf, priv->rx_buffer + NUM_DUMMY_BYTES, val_size);
+	memcpy(val_buf, priv->rx_buffer + SMI330_NUM_DUMMY_BYTES, val_size);
 
 	return 0;
 }
@@ -131,14 +128,12 @@ static const struct regmap_bus smi330_regmap_bus = {
 	.write = smi330_regmap_i2c_write,
 };
 
-static const struct regmap_config smi330_regmap_config = {
-	.reg_bits = 8,
-	.val_bits = 16,
-	.val_format_endian = REGMAP_ENDIAN_LITTLE,
-};
-
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 3, 0)
 static int smi330_i2c_probe(struct i2c_client *i2c,
 			    const struct i2c_device_id *id)
+#else
+static int smi330_i2c_probe(struct i2c_client *i2c)
+#endif
 {
 	struct device *dev = &i2c->dev;
 	struct smi330_i2c_priv *priv;
@@ -158,21 +153,33 @@ static int smi330_i2c_probe(struct i2c_client *i2c,
 	return smi330_core_probe(dev, regmap);
 }
 
-static const struct i2c_device_id smi330_i2c_id[] = { { "smi330", 0 }, {} };
-MODULE_DEVICE_TABLE(i2c, smi330_i2c_id);
+static const struct i2c_device_id smi330_i2c_device_id[] = {
+	{ .name = "smi330" },
+	{ }
+};
+MODULE_DEVICE_TABLE(i2c, smi330_i2c_device_id);
 
 static const struct of_device_id smi330_of_match[] = {
 	{ .compatible = "bosch,smi330" },
-	{},
+	{ }
 };
 MODULE_DEVICE_TABLE(of, smi330_of_match);
 
 static struct i2c_driver smi330_i2c_driver = {
 	.probe = smi330_i2c_probe,
-	.id_table = smi330_i2c_id,
+	.id_table = smi330_i2c_device_id,
 	.driver = {
 		.of_match_table = smi330_of_match,
 		.name = "smi330_i2c",
+	        .pm = pm_sleep_ptr(&smi330_pm_ops),
 	},
 };
 module_i2c_driver(smi330_i2c_driver);
+
+MODULE_AUTHOR("Stefan Gutmann <stefan.gutmann@de.bosch.com>");
+MODULE_AUTHOR("Roman Huber <roman.huber@de.bosch.com>");
+MODULE_AUTHOR("Filip Andrei <Andrei.Filip@ro.bosch.com>");
+MODULE_AUTHOR("Drimbarean Avram Andrei <Avram-Andrei.Drimbarean@ro.bosch.com>");
+MODULE_DESCRIPTION("Bosch SMI330 I2C driver");
+MODULE_LICENSE("Dual BSD/GPL");
+MODULE_IMPORT_NS(IIO_SMI330_NS);
