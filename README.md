@@ -81,9 +81,7 @@ See [Integration Guide](doc/IntegrationGuide.md) for a more comprehensive docume
 
 ## Documentation
 
-- [Online Documentation](https://boschmemssolutions.github.io/iio/bosch_smi330_IIO.html)
 - [Website](https://www.bosch-semiconductors.com/products/mems-sensors/adas/smi330/)
-- [Sysfs Interface](Documentation/sysfs-bus-iio-smi330)
 
 ## Architecture
 
