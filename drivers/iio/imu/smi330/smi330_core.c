@@ -2258,6 +2258,8 @@ static int smi330_write_event_config(struct iio_dev *indio_dev,
 				en_val = FIELD_PREP(en_mask, state);
 				break;
 			default:
+				en_mask = 0;
+				en_val = 0;
 				break;
 			}
 			int_mask = SMI330_INT_MAP1_ANYMO_MASK;
@@ -2278,6 +2280,8 @@ static int smi330_write_event_config(struct iio_dev *indio_dev,
 				en_val = FIELD_PREP(en_mask, state);
 				break;
 			default:
+				en_mask = 0;
+				en_val = 0;
 				break;
 			}
 			int_mask = SMI330_INT_MAP1_NOMO_MASK;
