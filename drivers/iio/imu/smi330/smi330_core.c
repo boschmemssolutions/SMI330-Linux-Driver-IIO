@@ -3,15 +3,15 @@
  * This file is provided under a dual BSD/GPLv2 license.  When using or
  * redistributing this file, you may do so under either license.
  *
+ * Copyright (c) 2024-2026 Robert Bosch GmbH. All rights reserved.
+ *
  * GPL LICENSE
- * Copyright (c) 2025 Robert Bosch GmbH. All rights reserved.
  *
  * This file is free software licensed under the terms of version 2
  * of the GNU General Public License, available from the file LICENSE-GPL
  * in the main directory of this source tree.
  *
  * BSD LICENSE
- * Copyright (c) 2025 Robert Bosch GmbH. All rights reserved.
  *
  * BSD-3-Clause
  *
@@ -51,10 +51,12 @@
 #include <linux/property.h>
 #include <linux/regmap.h>
 #include <linux/string.h>
+#include <linux/suspend.h>
 #include <linux/units.h>
 #include <linux/version.h>
 
 #include <linux/iio/buffer.h>
+#include <linux/iio/buffer_impl.h>
 #include <linux/iio/events.h>
 #include <linux/iio/iio.h>
 #include <linux/iio/sysfs.h>
@@ -64,18 +66,15 @@
 
 #include "smi330.h"
 
-#define SMI330_NO_ERROR_MASK (BIT(2) | BIT(0))
-
-#define SMI330_ALL_CHAN_MSK GENMASK(6, 0)
-
-#define SMI330_FIFO_MAX_LENGTH 1024
-#define SMI330_FIFO_MAX_FRAME_LENGTH 8
-
 #define SMI330_CHIP_ID 0x42
 
-#define SMI330_SPI_WR_MASK GENMASK(6, 0)
-#define SMI330_SPI_RD_MASK BIT(7)
+#define SMI330_FIFO_MAX_LENGTH (SMI330_FIFO_SIZE / (sizeof(u16)))
+#define SMI330_FIFO_FRAME_LENGTH 6
+#define SMI330_FIFO_MAX_WM \
+	((SMI330_FIFO_MAX_LENGTH - 1) - 3 * SMI330_FIFO_FRAME_LENGTH)
 
+#define SMI330_POWER_ON_DELAY 30000
+#define SMI330_SC_ST_DELAY 50000
 #define SMI330_SOFT_RESET_DELAY 2000
 #define SMI330_FEAT_ENG_POLL 10000
 #define SMI330_FEAT_ENG_TIMEOUT 1000000
@@ -138,6 +137,7 @@
 #define SMI330_FEATURE_IO0_TILT_EN_MASK BIT(11)
 #define SMI330_FEATURE_IO1_ERROR_MASK GENMASK(3, 0)
 #define SMI330_FEATURE_IO1_SC_COMPLETE_MASK BIT(4)
+#define SMI330_FEATURE_IO1_SC_RESULT_MASK BIT(5)
 #define SMI330_FEATURE_IO1_ST_RESULT_MASK BIT(6)
 #define SMI330_FEATURE_IO1_STATE_MASK GENMASK(12, 11)
 #define SMI330_FEATURE_IO_STATUS_MASK BIT(0)
@@ -156,8 +156,7 @@
 #define SMI330_FIFO_WATERMARK_MASK GENMASK(9, 0)
 #define SMI330_FIFO_CONF_MASK GENMASK(11, 9)
 #define SMI330_FIFO_CONF_TEMP_MASK BIT(11)
-#define SMI330_FIFO_CONF_GYR_MASK BIT(10)
-#define SMI330_FIFO_CONF_ACC_MASK BIT(9)
+#define SMI330_FIFO_CONF_ACC_GYR_EN_MSK GENMASK(10, 9)
 #define SMI330_FIFO_CTRL_FLUSH_MASK BIT(0)
 #define SMI330_IO_INT_CTRL_INT1_MASK GENMASK(2, 0)
 #define SMI330_IO_INT_CTRL_INT2_MASK GENMASK(10, 8)
@@ -216,13 +215,31 @@
 #define SMI330_MOTION1_ACC_REF_MASK BIT(12)
 #define SMI330_MOTION1_SLOPE_THRES_MASK GENMASK(11, 0)
 
-/* T°C = (temp / 512) + 23 */
-#define SMI330_TEMP_OFFSET 11776 /* 23 * 512 */
-#define SMI330_TEMP_SCALE 1953125 /* (1 / 512) * 1e9 */
+/* T°C = (temp / 256) + 23 */
+#define SMI330_TEMP_OFFSET 5888 /* 23 * 256 */
+#define SMI330_TEMP_SCALE 3906250 /* (1 / 256) * 1e9 */
 
-/* Non-constant mask variant of FIELD_GET() and FIELD_PREP() */
-#define field_get(_mask, _reg) (((_reg) & (_mask)) >> (ffs(_mask) - 1))
-#define field_prep(_mask, _val) (((_val) << (ffs(_mask) - 1)) & (_mask))
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 19, 0)
+#define field_prep(mask, val)                                        \
+	({                                                           \
+		__auto_type __mask = (mask);                         \
+		typeof(__mask) __val = (val);                        \
+		unsigned int __shift = BITS_PER_TYPE(__mask) <= 32 ? \
+						     __ffs(__mask) :       \
+						     __ffs64(__mask);      \
+		(__val << __shift) & __mask;                         \
+	})
+
+#define field_get(mask, reg)                                         \
+	({                                                           \
+		__auto_type __mask = (mask);                         \
+		typeof(__mask) __reg = (reg);                        \
+		unsigned int __shift = BITS_PER_TYPE(__mask) <= 32 ? \
+						     __ffs(__mask) :       \
+						     __ffs64(__mask);      \
+		(__reg & __mask) >> __shift;                         \
+	})
+#endif
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 16, 0)
 #define IIO_DECLARE_BUFFER_WITH_TS(type, name, count)          \
@@ -233,6 +250,28 @@
 	(iio_device_claim_direct_mode(indio_dev) == 0)
 
 #define iio_device_release_direct iio_device_release_direct_mode
+#endif
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 12, 0)
+#define iio_for_each_active_channel(indio_dev, chan)            \
+	for_each_set_bit((chan), (indio_dev)->active_scan_mask, \
+			 (indio_dev)->masklength)
+
+static int iio_device_suspend_triggering(struct iio_dev *indio_dev)
+{
+	if (indio_dev->pollfunc && indio_dev->pollfunc->irq > 0)
+		disable_irq(indio_dev->pollfunc->irq);
+
+	return 0;
+}
+
+static int iio_device_resume_triggering(struct iio_dev *indio_dev)
+{
+	if (indio_dev->pollfunc && indio_dev->pollfunc->irq > 0)
+		enable_irq(indio_dev->pollfunc->irq);
+
+	return 0;
+}
 #endif
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 4, 0)
@@ -354,7 +393,9 @@ enum smi330_accel_range {
 enum smi330_gyro_range {
 	SMI330_GYRO_RANGE_125 = 0x00,
 	SMI330_GYRO_RANGE_250 = 0x01,
-	SMI330_GYRO_RANGE_500 = 0x02
+	SMI330_GYRO_RANGE_500 = 0x02,
+	SMI330_GYRO_RANGE_1000 = 0x03,
+	SMI330_GYRO_RANGE_2000 = 0x04
 };
 
 enum smi330_odr {
@@ -489,18 +530,44 @@ struct smi330_sc_st_savestate {
 	int alt_gyr_cfg;
 };
 
+static const int smi330_reg_savestate[] = {
+	SMI330_ACCEL_CFG_REG,	  SMI330_GYRO_CFG_REG,
+	SMI330_ALT_ACCEL_CFG_REG, SMI330_ALT_GYRO_CFG_REG,
+	SMI330_ALT_CONF_REG,	  SMI330_FIFO_WATERMARK_REG,
+	SMI330_FIFO_CONF_REG,	  SMI330_IO_INT_CTRL_REG,
+	SMI330_INT_CONF_REG,	  SMI330_INT_MAP1_REG,
+	SMI330_INT_MAP2_REG,	  SMI330_FEATURE_IO0_REG,
+};
+
+static const u8 smi330_ext_reg_savestate[] = {
+	SMI330_ANYMO_1_EX_REG,	    SMI330_ANYMO_2_EX_REG,
+	SMI330_ANYMO_3_EX_REG,	    SMI330_NOMO_1_EX_REG,
+	SMI330_NOMO_2_EX_REG,	    SMI330_NOMO_3_EX_REG,
+	SMI330_TILT_1_EX_REG,	    SMI330_TILT_2_EX_REG,
+	SMI330_ALT_CONF_CHG_EX_REG,
+};
+
+struct smi330_regs_pm {
+	int reg_settings[ARRAY_SIZE(smi330_reg_savestate)];
+	int ext_reg_settings[ARRAY_SIZE(smi330_ext_reg_savestate)];
+	bool ext_valid;
+};
+
 struct smi330_data {
 	struct regmap *regmap;
 	struct smi330_cfg cfg;
 	struct smi330_savestate savestate;
+	struct smi330_regs_pm pm_state;
 	struct smi330_sc_st_savestate sc_st_savestate;
-	int adv_feat_irq;
+	int data_irq_num;
+	int feat_irq_num;
 	int watermark;
-	s64 hw_fifo_odr_ns;
+	bool acc_self_test_passed;
+	bool gyr_self_test_passed;
 	s64 current_timestamp;
 	s64 last_timestamp;
+	size_t ts_offset;
 	atomic64_t irq_timestamp;
-	struct mutex lock;
 	struct iio_trigger *trig;
 	__le16 fifo[SMI330_FIFO_MAX_LENGTH] __aligned(IIO_DMA_MINALIGN);
 	IIO_DECLARE_BUFFER_WITH_TS(__le16, buf, SMI330_SCAN_LEN);
@@ -554,6 +621,13 @@ static const struct iio_chan_spec smi330_channels[] = {
 	IIO_CHAN_SOFT_TIMESTAMP(SMI330_SCAN_TIMESTAMP),
 };
 
+static const unsigned long smi330_avail_scan_masks[] = {
+	(BIT(SMI330_SCAN_ACCEL_X) | BIT(SMI330_SCAN_ACCEL_Y) |
+	 BIT(SMI330_SCAN_ACCEL_Z) | BIT(SMI330_SCAN_GYRO_X) |
+	 BIT(SMI330_SCAN_GYRO_Y) | BIT(SMI330_SCAN_GYRO_Z)),
+	0
+};
+
 static const struct smi330_attributes smi330_mode_attr = {
 	.reg_vals = (int[]){ SMI330_MODE_SUSPEND, SMI330_MODE_LOW_POWER,
 			     SMI330_MODE_NORMAL, SMI330_MODE_HIGH_PERF },
@@ -576,7 +650,8 @@ static const struct smi330_attributes smi330_mode_alt_gyro_attr = {
 static const struct smi330_attributes smi330_accel_scale_attr = {
 	.reg_vals = (int[]){ SMI330_ACCEL_RANGE_2G, SMI330_ACCEL_RANGE_4G,
 			     SMI330_ACCEL_RANGE_8G, SMI330_ACCEL_RANGE_16G },
-	.vals = (int[]){ 0, 61035, 0, 122070, 0, 244140, 0, 488281 },
+	/* IIO accel scale is in m/s^2 per LSB */
+	.vals = (int[]){ 0, 598550, 0, 1197101, 0, 2394202, 0, 4788403 },
 	.len = 8,
 	.type = IIO_VAL_INT_PLUS_NANO,
 	.mask = SMI330_CFG_RANGE_MASK
@@ -584,9 +659,12 @@ static const struct smi330_attributes smi330_accel_scale_attr = {
 
 static const struct smi330_attributes smi330_gyro_scale_attr = {
 	.reg_vals = (int[]){ SMI330_GYRO_RANGE_125, SMI330_GYRO_RANGE_250,
-			     SMI330_GYRO_RANGE_500 },
-	.vals = (int[]){ 0, 3814697, 0, 7629395, 0, 15258789 },
-	.len = 6,
+			     SMI330_GYRO_RANGE_500, SMI330_GYRO_RANGE_1000,
+			     SMI330_GYRO_RANGE_2000 },
+	/* IIO angular velocity scale is in rad/s per LSB */
+	.vals = (int[]){ 0, 66579, 0, 133158, 0, 266316, 0, 532632, 0,
+			 1065264 },
+	.len = 10,
 	.type = IIO_VAL_INT_PLUS_NANO,
 	.mask = SMI330_CFG_RANGE_MASK
 };
@@ -649,18 +727,39 @@ static int smi330_write_with_readback(struct smi330_data *data, int reg,
 	return -EIO;
 }
 
+/* 
+ * Fix for bug in IIO core function iio_push_to_buffers_with_timestamp
+ * which does not align the timestamp correctly in the buffer.
+ * Ref. https://patchwork.kernel.org/project/linux-iio/patch/20250802171539.518747-1-jic23@kernel.org/
+ *
+ * Remove when fixed in the IIO core.
+ */
+static int smi330_iio_push_to_buffers_with_timestamp(struct iio_dev *indio_dev,
+						     __le16 *buf, int64_t ts)
+{
+	struct smi330_data *data = iio_priv(indio_dev);
+	memcpy(&buf[data->ts_offset], &ts, sizeof(ts));
+
+	return iio_push_to_buffers_with_timestamp(indio_dev, buf, ts);
+}
+
 static int smi330_get_regs_dma(u8 reg_addr, int *reg_data,
 			       struct smi330_data *data)
 {
 	int ret, status;
 
-	ret = regmap_read(data->regmap, SMI330_FEATURE_DATA_STATUS_REG,
-			  &status);
+	/*
+	 * Wait for the feature-engine handshake to become ready instead of
+	 * failing on the first not-ready read. A one-shot check can return
+	 * -EBUSY for a transient not-ready state and, when called from the
+	 * suspend path, abort the whole system suspend.
+	 */
+	ret = regmap_read_poll_timeout(
+		data->regmap, SMI330_FEATURE_DATA_STATUS_REG, status,
+		FIELD_GET(SMI330_FEATURE_DATA_STATUS_TX_READY_MASK, status),
+		SMI330_FEAT_ENG_POLL, SMI330_FEAT_ENG_TIMEOUT);
 	if (ret)
 		return ret;
-
-	if (!FIELD_GET(SMI330_FEATURE_DATA_STATUS_TX_READY_MASK, status))
-		return -EBUSY;
 
 	ret = regmap_write(data->regmap, SMI330_FEATURE_DATA_ADDR_REG,
 			   reg_addr);
@@ -675,13 +774,18 @@ static int smi330_set_regs_dma(u8 reg_addr, int reg_data,
 {
 	int ret, status;
 
-	ret = regmap_read(data->regmap, SMI330_FEATURE_DATA_STATUS_REG,
-			  &status);
+	/*
+	 * Wait for the feature-engine handshake to become ready instead of
+	 * failing on the first not-ready read. A one-shot check can return
+	 * -EBUSY for a transient not-ready state and, when called from the
+	 * suspend path, abort the whole system suspend.
+	 */
+	ret = regmap_read_poll_timeout(
+		data->regmap, SMI330_FEATURE_DATA_STATUS_REG, status,
+		FIELD_GET(SMI330_FEATURE_DATA_STATUS_TX_READY_MASK, status),
+		SMI330_FEAT_ENG_POLL, SMI330_FEAT_ENG_TIMEOUT);
 	if (ret)
 		return ret;
-
-	if (!FIELD_GET(SMI330_FEATURE_DATA_STATUS_TX_READY_MASK, status))
-		return -EBUSY;
 
 	ret = regmap_write(data->regmap, SMI330_FEATURE_DATA_ADDR_REG,
 			   reg_addr);
@@ -1043,7 +1147,6 @@ static int smi330_read_avail(struct iio_dev *indio_dev,
 		*vals = smi330_average_attr.vals;
 		*length = smi330_average_attr.len;
 		*type = smi330_average_attr.type;
-		*type = IIO_VAL_INT;
 		return IIO_AVAIL_LIST;
 	case IIO_CHAN_INFO_LOW_PASS_FILTER_3DB_FREQUENCY:
 		*vals = smi330_bandwidth_attr.vals;
@@ -1071,10 +1174,14 @@ static int smi330_read_raw(struct iio_dev *indio_dev,
 	/* valid for all channel types */
 	switch (mask) {
 	case IIO_CHAN_INFO_RAW:
-		if (!iio_device_claim_direct(indio_dev))
-			return -EBUSY;
+		if ((chan->type == IIO_ACCEL) || (chan->type == IIO_ANGL_VEL)) {
+			ret = iio_device_claim_direct_mode(indio_dev);
+			if (ret)
+				return ret;
+		}
 		ret = smi330_get_data(data, chan->type, chan->channel2, val);
-		iio_device_release_direct(indio_dev);
+		if ((chan->type == IIO_ACCEL) || (chan->type == IIO_ANGL_VEL))
+			iio_device_release_direct_mode(indio_dev);
 		return ret ? ret : IIO_VAL_INT;
 	default:
 		break;
@@ -1223,17 +1330,24 @@ static u16 smi330_get_fifo_length(struct smi330_data *data)
 	return fill_level & SMI330_FIFO_FILL_LEVEL_MASK;
 }
 
-static int smi330_get_fifo_frame_length(struct iio_dev *indio_dev)
+static int smi330_get_fifo_odr(struct smi330_data *data, s64 *tsamp)
 {
-	int i;
-	int fifo_frame_length = 0;
+	bool acc_en, gyro_en;
+	enum smi330_odr max_odr;
 
-	for_each_set_bit(i, indio_dev->active_scan_mask,
-			 indio_dev->masklength) {
-		fifo_frame_length++;
-	}
+	acc_en = (data->savestate.acc_pwr != SMI330_MODE_SUSPEND);
+	gyro_en = (data->savestate.gyr_pwr != SMI330_MODE_SUSPEND);
 
-	return fifo_frame_length;
+	if (acc_en && gyro_en)
+		max_odr = max(data->savestate.acc_odr, data->savestate.gyr_odr);
+	else if (acc_en)
+		max_odr = data->savestate.acc_odr;
+	else if (gyro_en)
+		max_odr = data->savestate.gyr_odr;
+	else
+		return -EINVAL;
+
+	return smi330_get_odr_ns(max_odr, tsamp);
 }
 
 static int smi330_config_auto_op_mode(struct smi330_data *data,
@@ -1296,7 +1410,7 @@ static int smi330_auto_op_cond(struct smi330_data *data,
 	return smi330_set_regs_dma(SMI330_ALT_CONF_CHG_EX_REG, val, data);
 }
 
-static int smi330_st_sc_store_config(struct smi330_data *data)
+static int smi330_sc_st_store_config(struct smi330_data *data)
 {
 	int ret;
 
@@ -1314,9 +1428,16 @@ static int smi330_st_sc_store_config(struct smi330_data *data)
 					    &data->sc_st_savestate.alt_gyr_cfg);
 }
 
-static int smi330_st_sc_set_precondition(struct smi330_data *data)
+static int smi330_sc_st_set_precondition(struct smi330_data *data)
 {
-	int ret, mask, acc_cfg;
+	int ret, mask, acc_cfg, io1_data;
+
+	ret = regmap_read(data->regmap, SMI330_FEATURE_IO1_REG, &io1_data);
+	if (ret)
+		return ret;
+
+	if (FIELD_GET(SMI330_FEATURE_IO1_STATE_MASK, io1_data))
+		return -EBUSY;
 
 	mask = SMI330_CFG_MODE_MASK | SMI330_CFG_ODR_MASK;
 
@@ -1327,6 +1448,8 @@ static int smi330_st_sc_set_precondition(struct smi330_data *data)
 	if (ret)
 		return ret;
 
+	fsleep(SMI330_POWER_ON_DELAY);
+
 	ret = smi330_set_sensor_config(data, SMI330_ALT_ACCEL, SMI330_MODE,
 				       SMI330_MODE_SUSPEND, true);
 	if (ret)
@@ -1336,7 +1459,7 @@ static int smi330_st_sc_set_precondition(struct smi330_data *data)
 					SMI330_MODE_SUSPEND, true);
 }
 
-static int smi330_st_sc_restore_config(struct smi330_data *data)
+static int smi330_sc_st_restore_config(struct smi330_data *data)
 {
 	int ret;
 
@@ -1384,7 +1507,9 @@ static int smi330_get_st_result(struct smi330_data *data,
 		if (ret)
 			return ret;
 
-		if (st_result != expected_result)
+		pr_info("Self-Test result: 0x%02x\n", st_result);
+
+		if ((st_result & expected_result) != expected_result)
 			return -EIO;
 	} else {
 		return -EIO;
@@ -1396,10 +1521,8 @@ static int smi330_get_st_result(struct smi330_data *data,
 static int smi330_set_self_test_mode(struct smi330_data *data,
 				     enum smi330_sensor sensor)
 {
-	int ret;
-
-	ret = regmap_write(data->regmap, SMI330_FEATURE_DATA_ADDR_REG,
-			   SMI330_ST_SELECT_EX_REG);
+	int ret = regmap_write(data->regmap, SMI330_FEATURE_DATA_ADDR_REG,
+			       SMI330_ST_SELECT_EX_REG);
 	if (ret)
 		return ret;
 
@@ -1416,15 +1539,15 @@ static int smi330_perform_self_test(struct smi330_data *data,
 {
 	int ret, cfg_restore;
 
+	ret = smi330_sc_st_store_config(data);
+	if (ret)
+		return ret;
+
+	ret = smi330_sc_st_set_precondition(data);
+	if (ret)
+		goto out;
+
 	ret = smi330_set_self_test_mode(data, sensor);
-	if (ret)
-		return ret;
-
-	ret = smi330_st_sc_store_config(data);
-	if (ret)
-		return ret;
-
-	ret = smi330_st_sc_set_precondition(data);
 	if (ret)
 		goto out;
 
@@ -1432,12 +1555,12 @@ static int smi330_perform_self_test(struct smi330_data *data,
 	if (ret)
 		goto out;
 
+	fsleep(SMI330_SC_ST_DELAY);
+
 	ret = smi330_get_st_result(data, sensor);
-	if (ret)
-		goto out;
 
 out:
-	cfg_restore = smi330_st_sc_restore_config(data);
+	cfg_restore = smi330_sc_st_restore_config(data);
 	return ret | cfg_restore;
 }
 
@@ -1459,22 +1582,15 @@ static int smi330_self_calibration(struct smi330_data *data,
 {
 	int ret, cfg_restore, io1_data;
 
-	ret = regmap_read(data->regmap, SMI330_FEATURE_IO1_REG, &io1_data);
+	ret = smi330_sc_st_store_config(data);
 	if (ret)
 		return ret;
 
-	if (FIELD_GET(SMI330_FEATURE_IO1_STATE_MASK, io1_data))
-		return -EBUSY;
+	ret = smi330_sc_st_set_precondition(data);
+	if (ret)
+		goto out;
 
 	ret = smi330_self_calib_select(data);
-	if (ret)
-		return ret;
-
-	ret = smi330_st_sc_store_config(data);
-	if (ret)
-		return ret;
-
-	ret = smi330_st_sc_set_precondition(data);
 	if (ret)
 		goto out;
 
@@ -1483,13 +1599,20 @@ static int smi330_self_calibration(struct smi330_data *data,
 	if (ret)
 		goto out;
 
+	fsleep(SMI330_SC_ST_DELAY);
+
 	ret = regmap_read_poll_timeout(
 		data->regmap, SMI330_FEATURE_IO1_REG, io1_data,
 		FIELD_GET(SMI330_FEATURE_IO1_SC_COMPLETE_MASK, io1_data) == 1,
 		SMI330_FEAT_ENG_POLL, SMI330_FEAT_ENG_TIMEOUT);
+	if (ret)
+		goto out;
+
+	if (!FIELD_GET(SMI330_FEATURE_IO1_SC_RESULT_MASK, io1_data))
+		ret = -EIO;
 
 out:
-	cfg_restore = smi330_st_sc_restore_config(data);
+	cfg_restore = smi330_sc_st_restore_config(data);
 	return ret | cfg_restore;
 }
 
@@ -1549,8 +1672,7 @@ static int smi330_soft_reset(struct smi330_data *data)
 	/* Performing a dummy read after a soft-reset */
 	regmap_read(data->regmap, SMI330_CHIP_ID_REG, &dummy_byte);
 
-	if (data->cfg.feat_irq != SMI330_INT_DISABLED)
-		ret = smi330_enable_feature_engine(data);
+	ret = smi330_enable_feature_engine(data);
 
 	return ret;
 }
@@ -1558,24 +1680,21 @@ static int smi330_soft_reset(struct smi330_data *data)
 static int smi330_fifo_handler(struct iio_dev *indio_dev)
 {
 	int ret = 0;
-	int index, chan, i, fifo_frame_length, fill_level, frame_count;
+	int i, fill_level, frame_count;
 	struct smi330_data *data = iio_priv(indio_dev);
-	__le16 *iio_buffer_iter = data->buf;
-	__le16 *fifo_iter = data->fifo;
-	s64 tsamp = data->hw_fifo_odr_ns;
-	s64 timestamp;
+	s64 timestamp, tsamp;
 
-	/* Ignore if buffer disabled */
-	if (!iio_buffer_enabled(indio_dev))
-		goto out;
-
-	fifo_frame_length = smi330_get_fifo_frame_length(indio_dev);
 	fill_level = smi330_get_fifo_length(data);
-	frame_count = fill_level / fifo_frame_length;
+	frame_count = fill_level / SMI330_FIFO_FRAME_LENGTH;
 
-	if (data->last_timestamp != 0 && frame_count != 0)
+	if (data->last_timestamp != 0 && frame_count != 0) {
 		tsamp = div_s64(data->current_timestamp - data->last_timestamp,
 				frame_count);
+	} else {
+		ret = smi330_get_fifo_odr(data, &tsamp);
+		if (ret)
+			return ret;
+	}
 
 	ret = regmap_noinc_read(data->regmap, SMI330_FIFO_DATA_REG, data->fifo,
 				fill_level * sizeof(__le16));
@@ -1583,24 +1702,19 @@ static int smi330_fifo_handler(struct iio_dev *indio_dev)
 		goto out;
 
 	for (i = 0; i < frame_count; i++) {
-		index = 0;
-		fifo_iter = &data->fifo[i * fifo_frame_length];
-
-		for_each_set_bit(chan, indio_dev->active_scan_mask,
-				 indio_dev->masklength) {
-			iio_buffer_iter[index++] = fifo_iter[chan];
-		}
+		memcpy(data->buf, &data->fifo[i * SMI330_FIFO_FRAME_LENGTH],
+		       SMI330_FIFO_FRAME_LENGTH * sizeof(__le16));
 		timestamp =
 			data->current_timestamp - tsamp * (frame_count - i - 1);
-		iio_push_to_buffers_with_timestamp(indio_dev, data->buf,
-						   timestamp);
+		smi330_iio_push_to_buffers_with_timestamp(indio_dev, data->buf,
+							  timestamp);
 	}
 
 	data->last_timestamp = data->current_timestamp;
 
 out:
 	fill_level = smi330_get_fifo_length(data);
-	if (fill_level > max(fifo_frame_length, data->watermark / 2))
+	if (fill_level > max(SMI330_FIFO_FRAME_LENGTH, data->watermark / 2))
 		regmap_write(data->regmap, SMI330_FIFO_CTRL_REG,
 			     SMI330_FIFO_CTRL_FLUSH_MASK);
 	return ret;
@@ -1612,12 +1726,7 @@ static irqreturn_t smi330_trigger_handler(int irq, void *p)
 	struct iio_dev *indio_dev = pf->indio_dev;
 	struct smi330_data *data = iio_priv(indio_dev);
 	struct device *dev = regmap_get_device(data->regmap);
-	int ret, chan;
-	int i = 0;
-
-	/* Ignore if buffer disabled */
-	if (!iio_buffer_enabled(indio_dev))
-		return 0;
+	int ret;
 
 	if (data->cfg.op_mode == SMI330_FIFO) {
 		dev_warn(dev, "Can't use trigger when FIFO enabled\n");
@@ -1629,17 +1738,11 @@ static irqreturn_t smi330_trigger_handler(int irq, void *p)
 	if (ret)
 		goto out;
 
-	if (*indio_dev->active_scan_mask != SMI330_ALL_CHAN_MSK) {
-		for_each_set_bit(chan, indio_dev->active_scan_mask,
-				 indio_dev->masklength)
-			data->buf[i++] = data->buf[chan];
-	}
-
-	iio_push_to_buffers_with_timestamp(indio_dev, data->buf, pf->timestamp);
+	smi330_iio_push_to_buffers_with_timestamp(indio_dev, data->buf,
+						  pf->timestamp);
 
 out:
 	iio_trigger_notify_done(indio_dev->trig);
-
 	return IRQ_HANDLED;
 }
 
@@ -1650,26 +1753,20 @@ static irqreturn_t smi330_irq_thread_handler(int irq, void *indio_dev_)
 	struct iio_dev *indio_dev = indio_dev_;
 	struct smi330_data *data = iio_priv(indio_dev);
 
-	mutex_lock(&data->lock);
-
 	data->current_timestamp = atomic64_read(&data->irq_timestamp);
 
 	ret = regmap_bulk_read(data->regmap, SMI330_INT1_STATUS_REG, int_status,
 			       2);
-	if (ret) {
-		mutex_unlock(&data->lock);
+	if (ret)
 		return IRQ_NONE;
-	}
 
 	int_stat = int_status[0] | int_status[1];
 
 	if (FIELD_GET(SMI330_INT_STATUS_FWM_MASK, int_stat) ||
 	    FIELD_GET(SMI330_INT_STATUS_FFULL_MASK, int_stat)) {
 		ret = smi330_fifo_handler(indio_dev);
-		if (ret) {
-			mutex_unlock(&data->lock);
+		if (ret)
 			return IRQ_NONE;
-		}
 	}
 
 	if (FIELD_GET(SMI330_INT_STATUS_ACC_GYR_DRDY_MASK, int_stat)) {
@@ -1703,8 +1800,6 @@ static irqreturn_t smi330_irq_thread_handler(int irq, void *indio_dev_)
 						  IIO_EV_DIR_EITHER),
 			       data->current_timestamp);
 	}
-
-	mutex_unlock(&data->lock);
 
 	return IRQ_HANDLED;
 }
@@ -1796,7 +1891,8 @@ static int smi330_setup_irq(struct device *dev, struct iio_dev *indio_dev,
 		return ret;
 
 	return devm_request_threaded_irq(dev, irq, smi330_irq_handler,
-					 smi330_irq_thread_handler, irq_type,
+					 smi330_irq_thread_handler,
+					 irq_type | IRQF_ONESHOT,
 					 indio_dev->name, indio_dev);
 }
 
@@ -1816,8 +1912,10 @@ static int smi330_register_irq(struct device *dev, struct iio_dev *indio_dev)
 		ret = smi330_setup_irq(dev, indio_dev, irq, SMI330_INT_1);
 		if (ret)
 			return ret;
+		if (cfg->data_irq == SMI330_INT_1)
+			data->data_irq_num = irq;
 		if (cfg->feat_irq == SMI330_INT_1)
-			data->adv_feat_irq = irq;
+			data->feat_irq_num = irq;
 	} else if (cfg->data_irq == SMI330_INT_1 ||
 		   cfg->feat_irq == SMI330_INT_1) {
 		return -ENODEV;
@@ -1828,8 +1926,10 @@ static int smi330_register_irq(struct device *dev, struct iio_dev *indio_dev)
 		ret = smi330_setup_irq(dev, indio_dev, irq, SMI330_INT_2);
 		if (ret)
 			return ret;
+		if (cfg->data_irq == SMI330_INT_2)
+			data->data_irq_num = irq;
 		if (cfg->feat_irq == SMI330_INT_2)
-			data->adv_feat_irq = irq;
+			data->feat_irq_num = irq;
 	} else if (cfg->data_irq == SMI330_INT_2 ||
 		   cfg->feat_irq == SMI330_INT_2) {
 		return -ENODEV;
@@ -1840,12 +1940,9 @@ static int smi330_register_irq(struct device *dev, struct iio_dev *indio_dev)
 
 static int smi330_hw_fifo_enable(struct iio_dev *indio_dev)
 {
-	int ret, i;
-	int val = 0;
+	int ret, val;
 	struct smi330_data *data = iio_priv(indio_dev);
 	struct device *dev = regmap_get_device(data->regmap);
-
-	data->last_timestamp = 0;
 
 	if (data->savestate.acc_pwr == SMI330_MODE_LOW_POWER ||
 	    data->savestate.gyr_pwr == SMI330_MODE_LOW_POWER) {
@@ -1853,32 +1950,11 @@ static int smi330_hw_fifo_enable(struct iio_dev *indio_dev)
 		return -EINVAL;
 	}
 
-	ret = smi330_get_odr_ns(max(data->savestate.acc_odr,
-				    data->savestate.gyr_odr),
-				&data->hw_fifo_odr_ns);
-	if (ret)
-		return ret;
-
-	for_each_set_bit(i, indio_dev->active_scan_mask,
-			 indio_dev->masklength) {
-		switch (i) {
-		case SMI330_SCAN_ACCEL_X:
-		case SMI330_SCAN_ACCEL_Y:
-		case SMI330_SCAN_ACCEL_Z:
-			val |= FIELD_PREP(SMI330_FIFO_CONF_ACC_MASK, 1);
-			break;
-		case SMI330_SCAN_GYRO_X:
-		case SMI330_SCAN_GYRO_Y:
-		case SMI330_SCAN_GYRO_Z:
-			val |= FIELD_PREP(SMI330_FIFO_CONF_GYR_MASK, 1);
-			break;
-		default:
-			break;
-		}
-	}
+	data->last_timestamp = 0;
 
 	ret = regmap_update_bits(data->regmap, SMI330_FIFO_CONF_REG,
-				 SMI330_FIFO_CONF_MASK, val);
+				 SMI330_FIFO_CONF_MASK,
+				 SMI330_FIFO_CONF_ACC_GYR_EN_MSK);
 	if (ret)
 		return ret;
 
@@ -1924,10 +2000,9 @@ static int smi330_hwfifo_set_watermark(struct iio_dev *indio_dev,
 {
 	struct smi330_data *data = iio_priv(indio_dev);
 
-	int fifo_frame_length = smi330_get_fifo_frame_length(indio_dev);
-	int abs_max_wm = (SMI330_FIFO_MAX_LENGTH - 1);
-	int max_wm = abs_max_wm - 3 * max(fifo_frame_length, 3);
-	data->watermark = min(fifo_frame_length * (int)val, max_wm);
+	data->watermark = SMI330_FIFO_FRAME_LENGTH * (int)val;
+	while (data->watermark > SMI330_FIFO_MAX_WM)
+		data->watermark = (data->watermark + 1) / 2;
 
 	return smi330_write_with_readback(data, SMI330_FIFO_WATERMARK_REG,
 					  data->watermark);
@@ -1935,7 +2010,14 @@ static int smi330_hwfifo_set_watermark(struct iio_dev *indio_dev,
 
 static int smi330_buffer_postenable(struct iio_dev *indio_dev)
 {
+	int last_bit;
 	struct smi330_data *data = iio_priv(indio_dev);
+
+	last_bit = find_last_bit(indio_dev->buffer->scan_mask,
+				 indio_dev->masklength);
+	data->ts_offset =
+		round_up(last_bit + 1, sizeof(data->current_timestamp) /
+					       sizeof(data->buf[0]));
 
 	if (iio_device_get_current_mode(indio_dev) == INDIO_BUFFER_TRIGGERED)
 		return 0;
@@ -1950,9 +2032,6 @@ static int smi330_buffer_predisable(struct iio_dev *indio_dev)
 {
 	struct smi330_data *data = iio_priv(indio_dev);
 
-	/* Don't break the current interrupt thread handler */
-	mutex_lock(&data->lock);
-
 	if (iio_device_get_current_mode(indio_dev) == INDIO_BUFFER_TRIGGERED)
 		return 0;
 
@@ -1962,25 +2041,10 @@ static int smi330_buffer_predisable(struct iio_dev *indio_dev)
 	return 0;
 }
 
-static int smi330_buffer_postdisable(struct iio_dev *indio_dev)
-{
-	struct smi330_data *data = iio_priv(indio_dev);
-
-	mutex_unlock(&data->lock);
-
-	return 0;
-}
-
 static int smi330_set_drdy_trigger_state(struct iio_trigger *trig, bool enable)
 {
 	int val;
 	struct smi330_data *data = iio_trigger_get_drvdata(trig);
-	struct device *dev = regmap_get_device(data->regmap);
-
-	if (data->cfg.op_mode == SMI330_FIFO) {
-		dev_warn(dev, "Can't set trigger when FIFO enabled\n");
-		return -EBUSY;
-	}
 
 	if (enable)
 		data->cfg.op_mode = SMI330_DATA_READY;
@@ -2125,7 +2189,8 @@ static ssize_t hwfifo_watermark_max_show(struct device *dev,
 					 struct device_attribute *attr,
 					 char *buf)
 {
-	return snprintf(buf, PAGE_SIZE, "%d\n", SMI330_FIFO_MAX_LENGTH - 1);
+	return snprintf(buf, PAGE_SIZE, "%d\n",
+			(int)SMI330_FIFO_MAX_LENGTH - 1);
 }
 
 static ssize_t hwfifo_fill_level_show(struct device *dev,
@@ -2153,25 +2218,77 @@ static ssize_t hwfifo_enabled_show(struct device *dev,
 static ssize_t self_test_acc_show(struct device *dev,
 				  struct device_attribute *attr, char *buf)
 {
+	int ret;
 	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
 	struct smi330_data *data = iio_priv(indio_dev);
+	bool st_passed = data->acc_self_test_passed;
 
-	if (smi330_perform_self_test(data, SMI330_ACCEL) == 0)
-		return sprintf(buf, "passed\n");
-	else
-		return sprintf(buf, "failed\n");
+	ret = iio_device_claim_direct_mode(indio_dev);
+	if (ret)
+		return snprintf(buf, PAGE_SIZE,
+				"failed claiming direct mode, last result: %s\n",
+				st_passed ? "passed" : "failed");
+
+	ret = smi330_perform_self_test(data, SMI330_ACCEL);
+
+	iio_device_release_direct_mode(indio_dev);
+
+	if (ret == 0) {
+		data->acc_self_test_passed = true;
+		return snprintf(buf, PAGE_SIZE, "passed\n");
+	} else {
+		data->acc_self_test_passed = false;
+		return snprintf(buf, PAGE_SIZE, "failed\n");
+	}
 }
 
 static ssize_t self_test_gyro_show(struct device *dev,
 				   struct device_attribute *attr, char *buf)
 {
+	int ret;
+	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
+	struct smi330_data *data = iio_priv(indio_dev);
+	bool st_passed = data->gyr_self_test_passed;
+
+	ret = iio_device_claim_direct_mode(indio_dev);
+	if (ret)
+		return snprintf(buf, PAGE_SIZE,
+				"failed claiming direct mode, last result: %s\n",
+				st_passed ? "passed" : "failed");
+
+	ret = smi330_perform_self_test(data, SMI330_GYRO);
+
+	iio_device_release_direct_mode(indio_dev);
+
+	if (ret == 0) {
+		data->gyr_self_test_passed = true;
+		return snprintf(buf, PAGE_SIZE, "passed\n");
+	} else {
+		data->gyr_self_test_passed = false;
+		return snprintf(buf, PAGE_SIZE, "failed\n");
+	}
+}
+
+static ssize_t self_cal_show(struct device *dev, struct device_attribute *attr,
+			     char *buf)
+{
+	int ret;
 	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
 	struct smi330_data *data = iio_priv(indio_dev);
 
-	if (smi330_perform_self_test(data, SMI330_GYRO) == 0)
-		return sprintf(buf, "passed\n");
+	ret = iio_device_claim_direct_mode(indio_dev);
+	if (ret)
+		return snprintf(buf, PAGE_SIZE,
+				"failed claiming direct mode\n");
+
+	ret = smi330_self_calibration(data, indio_dev);
+
+	iio_device_release_direct_mode(indio_dev);
+
+	if (ret == 0)
+		return snprintf(buf, PAGE_SIZE, "passed\n");
 	else
-		return sprintf(buf, "failed\n");
+		return snprintf(buf, PAGE_SIZE, "failed\n");
 }
 
 static ssize_t control_auto_op_mode_store(struct device *dev,
@@ -2421,20 +2538,6 @@ static ssize_t alt_gyr_odr_store(struct device *dev,
 	return count;
 }
 
-static ssize_t self_cal_store(struct device *dev, struct device_attribute *attr,
-			      const char *buf, size_t count)
-{
-	int ret;
-	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
-	struct smi330_data *data = iio_priv(indio_dev);
-
-	ret = smi330_self_calibration(data, indio_dev);
-	if (ret)
-		return ret;
-
-	return count;
-}
-
 static ssize_t soft_reset_store(struct device *dev,
 				struct device_attribute *attr, const char *buf,
 				size_t count)
@@ -2540,7 +2643,7 @@ static int smi330_write_event_config(struct iio_dev *indio_dev,
 				en_val = FIELD_PREP(en_mask, state);
 				break;
 			default:
-				break;
+				return -EINVAL;
 			}
 			int_mask = SMI330_INT_MAP1_ANYMO_MASK;
 			int_val = FIELD_PREP(int_mask, data->cfg.feat_irq);
@@ -2560,7 +2663,7 @@ static int smi330_write_event_config(struct iio_dev *indio_dev,
 				en_val = FIELD_PREP(en_mask, state);
 				break;
 			default:
-				break;
+				return -EINVAL;
 			}
 			int_mask = SMI330_INT_MAP1_NOMO_MASK;
 			int_val = FIELD_PREP(int_mask, data->cfg.feat_irq);
@@ -2715,11 +2818,98 @@ static int smi330_write_event_value(struct iio_dev *indio_dev,
 	return smi330_set_regs_dma(reg, config, data);
 }
 
+static void smi330_disable_irqs(struct smi330_data *data)
+{
+	if (data->data_irq_num >= 0)
+		disable_irq(data->data_irq_num);
+	if (data->feat_irq_num >= 0 && data->feat_irq_num != data->data_irq_num)
+		disable_irq(data->feat_irq_num);
+}
+
+static void smi330_enable_irqs(struct smi330_data *data)
+{
+	if (data->data_irq_num >= 0)
+		enable_irq(data->data_irq_num);
+	if (data->feat_irq_num >= 0 && data->feat_irq_num != data->data_irq_num)
+		enable_irq(data->feat_irq_num);
+}
+
+static int smi330_save_registers(struct smi330_data *data)
+{
+	struct smi330_regs_pm *pm = &data->pm_state;
+	struct device *dev = regmap_get_device(data->regmap);
+	int i, ret;
+
+	pm->ext_valid = false;
+
+	for (i = 0; i < ARRAY_SIZE(smi330_reg_savestate); i++) {
+		ret = regmap_read(data->regmap, smi330_reg_savestate[i],
+				  &pm->reg_settings[i]);
+		if (ret)
+			return ret;
+	}
+
+	/*
+	 * The advanced-feature registers are read through the feature-engine
+	 * data handshake, which only completes while the engine is active. If
+	 * the sensor is idle at suspend time the handshake never becomes ready.
+	 * Do not abort the whole system suspend for that: skip saving the
+	 * advanced-feature registers and skip restoring them on resume.
+	 */
+	for (i = 0; i < ARRAY_SIZE(smi330_ext_reg_savestate); i++) {
+		ret = smi330_get_regs_dma(smi330_ext_reg_savestate[i],
+					  &pm->ext_reg_settings[i], data);
+		if (ret) {
+			dev_warn(dev,
+				 "feature engine not ready, skipping advanced-feature register save (%d)\n",
+				 ret);
+			return 0;
+		}
+	}
+
+	pm->ext_valid = true;
+
+	return 0;
+}
+
+static int smi330_restore_registers(struct smi330_data *data)
+{
+	struct smi330_regs_pm *pm = &data->pm_state;
+	int i, ret;
+
+	if (pm->ext_valid) {
+		for (i = 0; i < ARRAY_SIZE(smi330_ext_reg_savestate); i++) {
+			ret = smi330_set_regs_dma(smi330_ext_reg_savestate[i],
+						  pm->ext_reg_settings[i],
+						  data);
+			if (ret)
+				return ret;
+		}
+	}
+
+	for (i = 0; i < ARRAY_SIZE(smi330_reg_savestate); i++) {
+		ret = smi330_write_with_readback(data, smi330_reg_savestate[i],
+						 pm->reg_settings[i]);
+		if (ret)
+			return ret;
+	}
+
+	/* Sync feature engine config after restoring FEATURE_IO0 */
+	return regmap_write(data->regmap, SMI330_FEATURE_IO_STATUS_REG,
+			    FIELD_PREP(SMI330_FEATURE_IO_STATUS_MASK, 1));
+}
+
 static int smi330_suspend(struct device *dev)
 {
 	int ret, io_status, int_val;
 	struct iio_dev *indio_dev = dev_get_drvdata(dev);
 	struct smi330_data *data = iio_priv(indio_dev);
+
+	dev_info(&indio_dev->dev, "Suspending device\n");
+
+	ret = iio_device_suspend_triggering(indio_dev);
+	if (ret)
+		return ret;
 
 	ret = regmap_read(data->regmap, SMI330_INT_MAP2_REG,
 			  &data->savestate.int_map2);
@@ -2730,20 +2920,28 @@ static int smi330_suspend(struct device *dev)
 	if (ret)
 		return ret;
 
+	smi330_disable_irqs(data);
+
+	if (pm_suspend_target_state >= PM_SUSPEND_MEM) {
+		ret = smi330_save_registers(data);
+		if (ret)
+			goto err_enable_irqs;
+	}
+
 	ret = smi330_set_sensor_config(data, SMI330_GYRO, SMI330_MODE,
 				       SMI330_MODE_SUSPEND, true);
 	if (ret)
-		return ret;
+		goto err_enable_irqs;
 
 	ret = smi330_set_sensor_config(data, SMI330_ALT_ACCEL, SMI330_MODE,
 				       SMI330_MODE_SUSPEND, true);
 	if (ret)
-		return ret;
+		goto err_enable_irqs;
 
 	ret = smi330_set_sensor_config(data, SMI330_ALT_GYRO, SMI330_MODE,
 				       SMI330_MODE_SUSPEND, true);
 	if (ret)
-		return ret;
+		goto err_enable_irqs;
 
 	if (device_may_wakeup(&indio_dev->dev)) {
 		ret = regmap_read(data->regmap, SMI330_FEATURE_IO0_REG,
@@ -2759,117 +2957,159 @@ static int smi330_suspend(struct device *dev)
 		ret = smi330_set_sensor_config(data, SMI330_ACCEL, SMI330_ODR,
 					       SMI330_ODR_100_HZ, true);
 		if (ret)
-			return ret;
+			goto err_enable_irqs;
 
 		ret = smi330_set_sensor_config(data, SMI330_ACCEL, SMI330_MODE,
 					       SMI330_MODE_LOW_POWER, true);
 		if (ret)
-			return ret;
+			goto err_enable_irqs;
 
 		ret = regmap_write(data->regmap, SMI330_FEATURE_IO0_REG,
 				   SMI330_FEATURE_IO0_ANYMO_EN_MASK);
 		if (ret)
-			return ret;
+			goto err_enable_irqs;
 
 		io_status = FIELD_PREP(SMI330_FEATURE_IO_STATUS_MASK, 1);
 		ret = regmap_write(data->regmap, SMI330_FEATURE_IO_STATUS_REG,
 				   io_status);
 		if (ret)
-			return ret;
+			goto err_enable_irqs;
 
 		int_val = FIELD_PREP(SMI330_INT_MAP1_ANYMO_MASK,
 				     data->cfg.feat_irq);
 		ret = regmap_write(data->regmap, SMI330_INT_MAP1_REG, int_val);
 		if (ret)
-			return ret;
+			goto err_enable_irqs;
 
-		ret = enable_irq_wake(data->adv_feat_irq);
+		/*
+		 * Arming the interrupt as a wake source is best effort: some
+		 * irqchips (e.g. bcm2835 GPIO) do not implement irq_set_wake
+		 * and return -ENXIO. That only means the device cannot wake the
+		 * system; it must not abort the whole suspend.
+		 */
+		ret = enable_irq_wake(data->feat_irq_num);
 		if (ret)
-			return ret;
+			dev_warn(&indio_dev->dev,
+				 "could not enable irq wake (%d), suspending without wakeup\n",
+				 ret);
 	} else {
 		ret = smi330_set_sensor_config(data, SMI330_ACCEL, SMI330_MODE,
 					       SMI330_MODE_SUSPEND, true);
 		if (ret)
-			return ret;
+			goto err_enable_irqs;
 	}
 
 	return 0;
+
+err_enable_irqs:
+	if (data->savestate.int_map2 != 0)
+		smi330_write_with_readback(data, SMI330_INT_MAP2_REG,
+					   data->savestate.int_map2);
+	smi330_enable_irqs(data);
+	iio_device_resume_triggering(indio_dev);
+	return ret;
 }
 
 static int smi330_resume(struct device *dev)
 {
-	int ret, io_status;
+	int ret, io_status, dummy_byte;
 	struct iio_dev *indio_dev = dev_get_drvdata(dev);
 	struct smi330_data *data = iio_priv(indio_dev);
 
+	dev_info(&indio_dev->dev, "Resuming device\n");
+
 	if (device_may_wakeup(&indio_dev->dev)) {
-		ret = disable_irq_wake(data->adv_feat_irq);
+		/* Best effort, mirrors enable_irq_wake() in smi330_suspend(). */
+		ret = disable_irq_wake(data->feat_irq_num);
 		if (ret)
-			return ret;
-
-		if (data->savestate.feat_io != 0) {
-			ret = regmap_write(data->regmap, SMI330_FEATURE_IO0_REG,
-					   data->savestate.feat_io);
-			if (ret)
-				return ret;
-
-			io_status =
-				FIELD_PREP(SMI330_FEATURE_IO_STATUS_MASK, 1);
-			ret = regmap_write(data->regmap,
-					   SMI330_FEATURE_IO_STATUS_REG,
-					   io_status);
-			if (ret)
-				return ret;
-		}
-
-		if (data->savestate.int_map1 != 0) {
-			ret = regmap_write(data->regmap, SMI330_INT_MAP1_REG,
-					   data->savestate.int_map1);
-			if (ret)
-				return ret;
-		}
+			dev_warn(&indio_dev->dev,
+				 "could not disable irq wake (%d)\n", ret);
 	}
 
-	ret = smi330_set_sensor_config(data, SMI330_ACCEL, SMI330_MODE,
-				       data->savestate.acc_pwr, true);
-	if (ret)
-		return ret;
+	if (pm_suspend_target_state >= PM_SUSPEND_MEM) {
+		/* Performing a dummy read after possible power-on reset */
+		regmap_read(data->regmap, SMI330_CHIP_ID_REG, &dummy_byte);
 
-	ret = smi330_set_sensor_config(data, SMI330_GYRO, SMI330_MODE,
-				       data->savestate.gyr_pwr, true);
-	if (ret)
-		return ret;
+		ret = smi330_soft_reset(data);
+		if (ret)
+			goto enable_irqs;
 
-	ret = smi330_set_sensor_config(data, SMI330_ALT_ACCEL, SMI330_MODE,
-				       data->savestate.alt_acc_pwr, true);
-	if (ret)
-		return ret;
+		ret = smi330_restore_registers(data);
+		if (ret)
+			goto enable_irqs;
+	} else {
+		if (device_may_wakeup(&indio_dev->dev)) {
+			if (data->savestate.feat_io != 0) {
+				ret = smi330_write_with_readback(
+					data, SMI330_FEATURE_IO0_REG,
+					data->savestate.feat_io);
+				if (ret)
+					goto enable_irqs;
 
-	ret = smi330_set_sensor_config(data, SMI330_ALT_GYRO, SMI330_MODE,
-				       data->savestate.alt_gyr_pwr, true);
-	if (ret)
-		return ret;
+				io_status =
+					FIELD_PREP(SMI330_FEATURE_IO_STATUS_MASK,
+						   1);
+				ret = smi330_write_with_readback(
+					data, SMI330_FEATURE_IO_STATUS_REG,
+					io_status);
+				if (ret)
+					goto enable_irqs;
+			}
 
-	ret = smi330_set_sensor_config(data, SMI330_ACCEL, SMI330_ODR,
-				       data->savestate.acc_odr, true);
-	if (ret)
-		return ret;
+			if (data->savestate.int_map1 != 0) {
+				ret = smi330_write_with_readback(
+					data, SMI330_INT_MAP1_REG,
+					data->savestate.int_map1);
+				if (ret)
+					goto enable_irqs;
+			}
+		}
+
+		ret = smi330_set_sensor_config(data, SMI330_GYRO, SMI330_MODE,
+					       data->savestate.gyr_pwr, true);
+		if (ret)
+			goto enable_irqs;
+
+		ret = smi330_set_sensor_config(data, SMI330_ALT_ACCEL,
+					       SMI330_MODE,
+					       data->savestate.alt_acc_pwr,
+					       true);
+		if (ret)
+			goto enable_irqs;
+
+		ret = smi330_set_sensor_config(data, SMI330_ALT_GYRO,
+					       SMI330_MODE,
+					       data->savestate.alt_gyr_pwr,
+					       true);
+		if (ret)
+			goto enable_irqs;
+
+		ret = smi330_set_sensor_config(data, SMI330_ACCEL, SMI330_MODE,
+					       data->savestate.acc_pwr, true);
+		if (ret)
+			goto enable_irqs;
+
+		ret = smi330_set_sensor_config(data, SMI330_ACCEL, SMI330_ODR,
+					       data->savestate.acc_odr, true);
+		if (ret)
+			goto enable_irqs;
+	}
 
 	if (data->cfg.op_mode == SMI330_FIFO) {
+		data->last_timestamp = 0;
 		ret = regmap_write(data->regmap, SMI330_FIFO_CTRL_REG,
 				   SMI330_FIFO_CTRL_FLUSH_MASK);
 		if (ret)
-			return ret;
+			goto enable_irqs;
 	}
 
-	if (data->savestate.int_map2 != 0) {
-		ret = smi330_write_with_readback(data, SMI330_INT_MAP2_REG,
-						 data->savestate.int_map2);
-		if (ret)
-			return ret;
-	}
-
-	return 0;
+enable_irqs:
+	if (data->savestate.int_map2 != 0)
+		smi330_write_with_readback(data, SMI330_INT_MAP2_REG,
+					   data->savestate.int_map2);
+	smi330_enable_irqs(data);
+	iio_device_resume_triggering(indio_dev);
+	return ret;
 }
 
 DEFINE_SIMPLE_DEV_PM_OPS(smi330_pm_ops, smi330_suspend, smi330_resume);
@@ -2878,12 +3118,6 @@ EXPORT_SYMBOL_NS_GPL(smi330_pm_ops, IIO_SMI330_NS);
 static IIO_DEVICE_ATTR_WO(control_auto_op_mode, 0);
 static IIO_DEVICE_ATTR_WO(set_auto_op_mode_cond, 0);
 static IIO_DEVICE_ATTR_WO(config_user_overwrite, 0);
-
-static IIO_DEVICE_ATTR_RO(self_test_acc, 0);
-static IIO_DEVICE_ATTR_RO(self_test_gyro, 0);
-static IIO_DEVICE_ATTR_WO(self_cal, 0);
-static IIO_DEVICE_ATTR_WO(soft_reset, 0);
-
 static IIO_DEVICE_ATTR_RW(alt_acc_mode, 0);
 static IIO_DEVICE_ATTR_RW(alt_acc_avg_num, 0);
 static IIO_DEVICE_ATTR_RW(alt_acc_odr, 0);
@@ -2896,10 +3130,6 @@ static struct attribute *smi330_event_attributes[] = {
 	&iio_dev_attr_control_auto_op_mode.dev_attr.attr,
 	&iio_dev_attr_set_auto_op_mode_cond.dev_attr.attr,
 	&iio_dev_attr_config_user_overwrite.dev_attr.attr,
-	&iio_dev_attr_self_test_acc.dev_attr.attr,
-	&iio_dev_attr_self_test_gyro.dev_attr.attr,
-	&iio_dev_attr_self_cal.dev_attr.attr,
-	&iio_dev_attr_soft_reset.dev_attr.attr,
 	&iio_dev_attr_alt_acc_mode.dev_attr.attr,
 	&iio_dev_attr_alt_acc_avg_num.dev_attr.attr,
 	&iio_dev_attr_alt_acc_odr.dev_attr.attr,
@@ -2912,6 +3142,23 @@ static struct attribute *smi330_event_attributes[] = {
 
 static const struct attribute_group smi330_event_attribute_group = {
 	.attrs = smi330_event_attributes,
+};
+
+static IIO_DEVICE_ATTR_RO(self_test_acc, 0);
+static IIO_DEVICE_ATTR_RO(self_test_gyro, 0);
+static IIO_DEVICE_ATTR_RO(self_cal, 0);
+static IIO_DEVICE_ATTR_WO(soft_reset, 0);
+
+static struct attribute *smi330_dev_attributes[] = {
+	&iio_dev_attr_self_test_acc.dev_attr.attr,
+	&iio_dev_attr_self_test_gyro.dev_attr.attr,
+	&iio_dev_attr_self_cal.dev_attr.attr,
+	&iio_dev_attr_soft_reset.dev_attr.attr,
+	NULL,
+};
+
+static const struct attribute_group smi330_dev_attribute_group = {
+	.attrs = smi330_dev_attributes,
 };
 
 static IIO_DEVICE_ATTR_RO(hwfifo_watermark_min, 0);
@@ -2940,7 +3187,6 @@ static const struct iio_dev_attr *smi330_fifo_attributes[] = {
 static const struct iio_buffer_setup_ops smi330_buffer_ops = {
 	.postenable = smi330_buffer_postenable,
 	.predisable = smi330_buffer_predisable,
-	.postdisable = smi330_buffer_postdisable,
 };
 
 static const struct iio_trigger_ops smi330_trigger_ops = {
@@ -2948,6 +3194,7 @@ static const struct iio_trigger_ops smi330_trigger_ops = {
 };
 
 static struct iio_info smi330_info = {
+	.attrs = &smi330_dev_attribute_group,
 	.read_event_config = smi330_read_event_config,
 	.read_event_value = smi330_read_event_value,
 	.write_event_config = smi330_write_event_config,
@@ -2986,7 +3233,7 @@ static int smi330_dev_init(struct smi330_data *data)
 
 int smi330_core_probe(struct device *dev, struct regmap *regmap)
 {
-	int ret;
+	int ret, dummy_byte;
 	struct iio_dev *indio_dev;
 	struct smi330_data *data;
 
@@ -2997,7 +3244,6 @@ int smi330_core_probe(struct device *dev, struct regmap *regmap)
 	data = iio_priv(indio_dev);
 	dev_set_drvdata(dev, indio_dev);
 	data->regmap = regmap;
-	mutex_init(&data->lock);
 
 	if (IS_ENABLED(CONFIG_SMI330_IRQ_DATA_INT1))
 		data->cfg.data_irq = SMI330_INT_1;
@@ -3013,18 +3259,33 @@ int smi330_core_probe(struct device *dev, struct regmap *regmap)
 	else
 		data->cfg.feat_irq = SMI330_INT_DISABLED;
 
+	/* Performing a dummy read after possible power-on reset */
+	regmap_read(data->regmap, SMI330_CHIP_ID_REG, &dummy_byte);
+
 	ret = smi330_soft_reset(data);
 	if (ret)
 		return dev_err_probe(dev, ret, "Soft reset failed\n");
 
 	indio_dev->channels = smi330_channels;
 	indio_dev->num_channels = ARRAY_SIZE(smi330_channels);
+	indio_dev->available_scan_masks = smi330_avail_scan_masks;
 	indio_dev->name = "smi330";
 	indio_dev->modes = INDIO_DIRECT_MODE | INDIO_BUFFER_SOFTWARE;
 	indio_dev->info = &smi330_info;
 
+	/*
+	 * Emit timestamps in the boot-time domain so they match Android's
+	 * elapsedRealtimeNano() expected by the sensor HAL, and so all Bosch
+	 * IIO devices share one common clock (required for accel/gyro fusion).
+	 */
+	iio_device_set_clock(indio_dev, CLOCK_BOOTTIME);
+
+	data->data_irq_num = -1;
+	data->feat_irq_num = -1;
 	data->watermark = 1;
 	data->cfg.op_mode = SMI330_IDLE;
+	data->acc_self_test_passed = false;
+	data->gyr_self_test_passed = false;
 	data->savestate.acc_pwr = SMI330_MODE_SUSPEND;
 	data->savestate.gyr_pwr = SMI330_MODE_SUSPEND;
 	data->savestate.alt_acc_pwr = SMI330_MODE_SUSPEND;
@@ -3034,6 +3295,7 @@ int smi330_core_probe(struct device *dev, struct regmap *regmap)
 	data->savestate.int_map1 = 0;
 	data->savestate.int_map2 = 0;
 	data->savestate.feat_io = 0;
+	data->pm_state.ext_valid = false;
 
 	ret = smi330_dev_init(data);
 	if (ret)

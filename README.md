@@ -27,7 +27,7 @@ The SMI330 is a highly integrated, low-power inertial measurement unit (IMU) tha
 
 ### Core Functionality
 - **3-axis accelerometer** with configurable ranges: ±2g, ±4g, ±8g, ±16g
-- **3-axis gyroscope** with configurable ranges: ±125°/s, ±250°/s, ±500°/s
+- **3-axis gyroscope** with configurable ranges: ±125°/s, ±250°/s, ±500°/s, ±1000°/s, ±2000°/s
 - **Temperature sensor** with operating range: -40°C to +125°C
 - **Hardware FIFO** with configurable watermark levels
 - **Multiple communication interfaces**: I2C and SPI
@@ -81,7 +81,9 @@ See [Integration Guide](doc/IntegrationGuide.md) for a more comprehensive docume
 
 ## Documentation
 
+- [Online Documentation](https://boschmemssolutions.github.io/iio/bosch_smi330_IIO.html)
 - [Website](https://www.bosch-semiconductors.com/products/mems-sensors/adas/smi330/)
+- [Sysfs Interface](Documentation/sysfs-bus-iio-smi330)
 
 ## Architecture
 

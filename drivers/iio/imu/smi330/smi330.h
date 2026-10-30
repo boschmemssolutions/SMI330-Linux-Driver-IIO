@@ -3,15 +3,15 @@
  * This file is provided under a dual BSD/GPLv2 license.  When using or
  * redistributing this file, you may do so under either license.
  *
- * GPL LICENSE
  * Copyright (c) 2024 Robert Bosch GmbH. All rights reserved.
+ *
+ * GPL LICENSE
  *
  * This file is free software licensed under the terms of version 2
  * of the GNU General Public License, available from the file LICENSE-GPL
  * in the main directory of this source tree.
  *
  * BSD LICENSE
- * Copyright (c) 2024 Robert Bosch GmbH. All rights reserved.
  *
  * BSD-3-Clause
  *

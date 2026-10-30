@@ -240,16 +240,16 @@ The SMI330 driver provides a comprehensive IIO (Industrial I/O) interface for se
 **Scale & Offset:**
 ```bash
 # Conversion factors (read-only)
-/sys/bus/iio/devices/iio:deviceX/in_accel_scale      # g/LSB  
-/sys/bus/iio/devices/iio:deviceX/in_anglvel_scale    # °/s/LSB
+/sys/bus/iio/devices/iio:deviceX/in_accel_scale      # m/s^2/LSB
+/sys/bus/iio/devices/iio:deviceX/in_anglvel_scale    # rad/s/LSB
 /sys/bus/iio/devices/iio:deviceX/in_temp_scale       # °C/LSB
 /sys/bus/iio/devices/iio:deviceX/in_temp_offset      # Temperature offset
 ```
 
 **Data Conversion:**
 ```
-Acceleration [g] = in_accel_x_raw * in_accel_scale
-Angular Rate [°/s] = in_anglvel_x_raw * in_anglvel_scale  
+Acceleration [m/s^2] = in_accel_x_raw * in_accel_scale
+Angular Rate [rad/s] = in_anglvel_x_raw * in_anglvel_scale
 Temperature [°C] = (in_temp_raw + in_temp_offset) * in_temp_scale
 ```
 
@@ -274,12 +274,12 @@ echo 100 > /sys/bus/iio/devices/iio:deviceX/in_anglvel_sampling_frequency
 **Measurement Ranges:**
 ```bash
 # Configure accelerometer range via scale
-echo 0.000244140 > /sys/bus/iio/devices/iio:deviceX/in_accel_scale  # ±8g
-# Available scales: 0.000061035 (±2g), 0.000122070 (±4g), 0.000244140 (±8g), 0.000488281 (±16g)
+echo 0.002394202 > /sys/bus/iio/devices/iio:deviceX/in_accel_scale  # ±8g equivalent
+# Available scales: 0.000598550 (±2g), 0.001197101 (±4g), 0.002394202 (±8g), 0.004788403 (±16g)
 
 # Configure gyroscope range via scale  
-echo 0.007629395 > /sys/bus/iio/devices/iio:deviceX/in_anglvel_scale  # ±250°/s
-# Available scales: 0.003814697 (±125°/s), 0.007629395 (±250°/s), 0.015258789 (±500°/s)
+echo 0.000133158 > /sys/bus/iio/devices/iio:deviceX/in_anglvel_scale  # ±250°/s equivalent
+# Available scales: 0.000066579 (±125°/s), 0.000133158 (±250°/s), 0.000266316 (±500°/s), 0.000532632 (±1000°/s), 0.001065264 (±2000°/s)
 ```
 
 **Oversampling/Averaging:**
@@ -360,7 +360,10 @@ cat /sys/bus/iio/devices/iio:deviceX/self_test_acc
 cat /sys/bus/iio/devices/iio:deviceX/self_test_gyro
 
 # Execute gyroscope self-calibration
-echo 1 > /sys/bus/iio/devices/iio:deviceX/self_cal
+cat /sys/bus/iio/devices/iio:deviceX/self_cal
+
+# WARNING: Self-calibration results are lost after a soft-reset or power cycle.
+# Re-run self-calibration after any reset to restore calibration.
 
 # Perform soft reset
 echo 1 > /sys/bus/iio/devices/iio:deviceX/soft_reset
@@ -521,7 +524,6 @@ echo 100 > /sys/bus/iio/devices/iio:device0/buffer0/watermark
 ## 6. Known Limitations
 
 **Hardware Limitations:**
-* **Gyroscope Range:** Currently limited to ±125/250/500°/s (hardware supports up to ±2000°/s)
 * **FIFO Timestamp:** Hardware FIFO does not store timestamps; software timestamps added during readout
 
 **Driver Implementation Limitations:**

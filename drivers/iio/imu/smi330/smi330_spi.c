@@ -3,15 +3,15 @@
  * This file is provided under a dual BSD/GPLv2 license.  When using or
  * redistributing this file, you may do so under either license.
  *
+ * Copyright (c) 2024, 2025 Robert Bosch GmbH. All rights reserved.
+ *
  * GPL LICENSE
- * Copyright (c) 2024 Robert Bosch GmbH. All rights reserved.
  *
  * This file is free software licensed under the terms of version 2
  * of the GNU General Public License, available from the file LICENSE-GPL
  * in the main directory of this source tree.
  *
  * BSD LICENSE
- * Copyright (c) 2024 Robert Bosch GmbH. All rights reserved.
  *
  * BSD-3-Clause
  *
@@ -128,4 +128,8 @@ MODULE_AUTHOR("Filip Andrei <Andrei.Filip@ro.bosch.com>");
 MODULE_AUTHOR("Drimbarean Avram Andrei <Avram-Andrei.Drimbarean@ro.bosch.com>");
 MODULE_DESCRIPTION("Bosch SMI330 SPI driver");
 MODULE_LICENSE("Dual BSD/GPL");
-MODULE_IMPORT_NS(IIO_SMI330_NS);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 13, 0)
+MODULE_IMPORT_NS(IIO_SMI330);
+#else
+MODULE_IMPORT_NS("IIO_SMI330");
+#endif
